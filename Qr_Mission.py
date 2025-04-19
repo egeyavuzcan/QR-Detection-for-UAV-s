@@ -1,191 +1,165 @@
+#!/usr/bin/env python3
+"""
+UAV Mission Planner Module.
 
-from __future__ import print_function
+This module provides the MissionPlanner class to connect to a UAV,
+create a square mission, and execute it automatically.
+"""
 
-from dronekit import connect, VehicleMode, LocationGlobalRelative, LocationGlobal, Command
+import argparse
 import time
 import math
+from dronekit import connect, VehicleMode, LocationGlobalRelative, LocationGlobal, Command
 from pymavlink import mavutil
 
-# Set up option parsing to get connection string
-import argparse
 
-vehicle = connect('127.0.0.1:14550', wait_ready=True)
+class MissionPlanner:
+    """Class to plan and execute UAV missions."""
 
+    def __init__(self, connection_string: str):
+        """
+        Connect to the vehicle.
 
-def get_location_metres(original_location, dNorth, dEast):
-    """
-    Returns a LocationGlobal object containing the latitude/longitude `dNorth` and `dEast` metres from the
-    specified `original_location`. The returned Location has the same `alt` value
-    as `original_location`.
+        Args:
+            connection_string: MAVLink connection string (e.g., '127.0.0.1:14550').
+        """
+        print(f"Connecting to vehicle on {connection_string}")
+        self.vehicle = connect(connection_string, wait_ready=True)
 
-    The function is useful when you want to move the vehicle around specifying locations relative to
-    the current vehicle position.
-    The algorithm is relatively accurate over small distances (10m within 1km) except close to the poles.
-    For more information see:
-    http://gis.stackexchange.com/questions/2951/algorithm-for-offsetting-a-latitude-longitude-by-some-amount-of-meters
-    """
-    earth_radius = 6378137.0  # Radius of "spherical" earth
-    # Coordinate offsets in radians
-    dLat = dNorth / earth_radius
-    dLon = dEast / (earth_radius * math.cos(math.pi * original_location.lat / 180))
+    def get_location_metres(self, original_location, dNorth: float, dEast: float):
+        """
+        Return LocationGlobal shifted by dNorth and dEast meters.
+        """
+        earth_radius = 6378137.0  # meters
+        dLat = dNorth / earth_radius
+        dLon = dEast / (earth_radius * math.cos(math.pi * original_location.lat / 180))
+        newlat = original_location.lat + (dLat * 180 / math.pi)
+        newlon = original_location.lon + (dLon * 180 / math.pi)
+        return LocationGlobal(newlat, newlon, original_location.alt)
 
-    # New position in decimal degrees
-    newlat = original_location.lat + (dLat * 180 / math.pi)
-    newlon = original_location.lon + (dLon * 180 / math.pi)
-    return LocationGlobal(newlat, newlon, original_location.alt)
+    def get_distance_metres(self, loc1, loc2):
+        """
+        Compute ground distance in meters between two locations.
+        """
+        dlat = loc2.lat - loc1.lat
+        dlon = loc2.lon - loc1.lon
+        return math.sqrt((dlat**2) + (dlon**2)) * 1.113195e5
 
+    def distance_to_current_waypoint(self):
+        """
+        Return distance to current waypoint or None if at home.
+        """
+        next_wp = self.vehicle.commands.next
+        if next_wp == 0:
+            return None
+        cmd = self.vehicle.commands[next_wp - 1]
+        target = LocationGlobalRelative(cmd.x, cmd.y, cmd.z)
+        return self.get_distance_metres(self.vehicle.location.global_frame, target)
 
-def get_distance_metres(aLocation1, aLocation2):
-    """
-    Returns the ground distance in metres between two LocationGlobal objects.
+    def clear_mission(self):
+        """Clear all existing mission commands."""
+        cmds = self.vehicle.commands
+        cmds.clear()
+        cmds.upload()
+        print("Cleared existing mission commands.")
 
-    This method is an approximation, and will not be accurate over large distances and close to the
-    earth's poles. It comes from the ArduPilot test code:
-    https://github.com/diydrones/ardupilot/blob/master/Tools/autotest/common.py
-    """
-    dlat = aLocation2.lat - aLocation1.lat
-    dlong = aLocation2.lon - aLocation1.lon
-    return math.sqrt((dlat * dlat) + (dlong * dlong)) * 1.113195e5
+    def add_square_mission(self, reference_location, size: float):
+        """
+        Create a square mission around reference_location with side size*2.
+        """
+        cmds = self.vehicle.commands
+        print("Defining new square mission commands.")
+        # Takeoff command
+        cmds.add(Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, 0, 10))
+        # Four waypoint corners
+        points = [
+            self.get_location_metres(reference_location,  size, -size),
+            self.get_location_metres(reference_location,  size,  size),
+            self.get_location_metres(reference_location, -size,  size),
+            self.get_location_metres(reference_location, -size, -size),
+        ]
+        altitudes = [11, 12, 13, 14]
+        for pt, alt in zip(points, altitudes):
+            cmds.add(Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                             mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0, 0, 0, 0,
+                             pt.lat, pt.lon, alt))
+        # Dummy waypoint to signal end
+        cmds.add(Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                         mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0, 0, 0, 0,
+                         points[-1].lat, points[-1].lon, 20))
+        cmds.upload()
+        print("Uploaded square mission commands.")
 
+    def arm_and_takeoff(self, target_altitude: float):
+        """Arm vehicle and take off to target_altitude."""
+        print("Performing pre-arm checks...")
+        self.vehicle.mode = VehicleMode("GUIDED")
+        self.vehicle.armed = True
+        while not self.vehicle.armed:
+            print(" Waiting for arming...")
+            time.sleep(1)
+        print(f"Taking off to {target_altitude} meters.")
+        self.vehicle.simple_takeoff(target_altitude)
+        while True:
+            altitude = self.vehicle.location.global_relative_frame.alt
+            print(f"Altitude: {altitude:.1f}")
+            if altitude >= target_altitude * 0.95:
+                print("Reached target altitude.")
+                break
+            time.sleep(1)
 
-def distance_to_current_waypoint():
-    """
-    Gets distance in metres to the current waypoint.
-    It returns None for the first waypoint (Home location).
-    """
-    nextwaypoint = vehicle.commands.next
-    if nextwaypoint == 0:
-        return None
-    missionitem = vehicle.commands[nextwaypoint - 1]  # commands are zero indexed
-    lat = missionitem.x
-    lon = missionitem.y
-    alt = missionitem.z
-    targetWaypointLocation = LocationGlobalRelative(lat, lon, alt)
-    distancetopoint = get_distance_metres(vehicle.location.global_frame, targetWaypointLocation)
-    return distancetopoint
+    def execute_mission(self):
+        """Start auto mission and monitor waypoints."""
+        print("Starting mission.")
+        self.vehicle.commands.next = 0
+        self.vehicle.mode = VehicleMode("AUTO")
+        while True:
+            next_wp = self.vehicle.commands.next
+            dist = self.distance_to_current_waypoint()
+            print(f"Waypoint {next_wp}, distance: {dist}")
+            if next_wp == 3:
+                print("Skipping to waypoint 5.")
+                self.vehicle.commands.next = 5
+            if next_wp == 5:
+                print("Final waypoint reached. Exiting mission.")
+                break
+            time.sleep(1)
 
-
-def download_mission():
-    """
-    Download the current mission from the vehicle.
-    """
-    cmds = vehicle.commands
-    cmds.download()
-    cmds.wait_ready()  # wait until download is complete.
-
-
-def adds_square_mission(aLocation, aSize):
-    """
-    Adds a takeoff command and four waypoint commands to the current mission.
-    The waypoints are positioned to form a square of side length 2*aSize around the specified LocationGlobal (aLocation).
-
-    The function assumes vehicle.commands matches the vehicle mission state
-    (you must have called download at least once in the session and after clearing the mission)
-    """
-
-    cmds = vehicle.commands
-
-    print(" Clear any existing commands")
-    cmds.clear()
-
-    print(" Define/add new commands.")
-    # Add new commands. The meaning/order of the parameters is documented in the Command class.
-
-    # Add MAV_CMD_NAV_TAKEOFF command. This is ignored if the vehicle is already in the air.
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0,
-                0, 0, 0, 0, 10))
-
-    # Define the four MAV_CMD_NAV_WAYPOINT locations and add the commands
-    point1 = get_location_metres(aLocation, aSize, -aSize)
-    point2 = get_location_metres(aLocation, aSize, aSize)
-    point3 = get_location_metres(aLocation, -aSize, aSize)
-    point4 = get_location_metres(aLocation, -aSize, -aSize)
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0,
-                0, 0, 0, point1.lat, point1.lon, 11))
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0,
-                0, 0, 0, point2.lat, point2.lon, 12))
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0,
-                0, 0, 0, point3.lat, point3.lon, 13))
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0,
-                0, 0, 0, point4.lat, point4.lon, 14))
-    # add dummy waypoint "5" at point 4 (lets us know when have reached destination)
-    cmds.add(
-        Command(0, 0, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0,
-                0, 0, 0, point4.lat, point4.lon, 20))
-
-    print(" Upload new commands to vehicle")
-    cmds.upload()
-
-
-def arm_and_takeoff(aTargetAltitude):
-    """
-    Arms vehicle and fly to aTargetAltitude.
-    """
-
-    print("Basic pre-arm checks")
-    # Don't let the user try to arm until autopilot is ready
-
-    print("Arming motors")
-    # Copter should arm in GUIDED mode
-    vehicle.mode = VehicleMode("GUIDED")
-    vehicle.armed = True
-
-    while not vehicle.armed:
-        print(" Waiting for arming...")
-        time.sleep(1)
-
-    print("Taking off!")
-    vehicle.simple_takeoff(aTargetAltitude)  # Take off to target altitude
-
-    # Wait until the vehicle reaches a safe height before processing the goto (otherwise the command
-    #  after Vehicle.simple_takeoff will execute immediately).
-    while True:
-        print(" Altitude: ", vehicle.location.global_relative_frame.alt)
-        if vehicle.location.global_relative_frame.alt >= aTargetAltitude * 0.95:  # Trigger just below target alt.
-            print("Reached target altitude")
-            break
-        time.sleep(1)
+    def return_to_launch(self):
+        """Command vehicle to return to launch and close connection."""
+        print("Returning to launch.")
+        self.vehicle.mode = VehicleMode("RTL")
+        print("Closing vehicle connection.")
+        self.vehicle.close()
 
 
-print('Create a new mission (for current location)')
-adds_square_mission(vehicle.location.global_frame, 50)
+def main():
+    """Parse arguments and execute mission planner."""
+    parser = argparse.ArgumentParser(description="UAV Square Mission Planner")
+    parser.add_argument(
+        "--connection", type=str, default="127.0.0.1:14550",
+        help="MAVLink connection string for the vehicle."
+    )
+    parser.add_argument(
+        "--size", type=float, default=50,
+        help="Half side length of square mission in meters."
+    )
+    parser.add_argument(
+        "--altitude", type=float, default=10,
+        help="Takeoff target altitude in meters."
+    )
+    args = parser.parse_args()
+    planner = MissionPlanner(args.connection)
+    planner.clear_mission()
+    # Download mission to sync before planning
+    planner.vehicle.commands.download()
+    planner.vehicle.commands.wait_ready()
+    planner.add_square_mission(planner.vehicle.location.global_frame, args.size)
+    planner.arm_and_takeoff(args.altitude)
+    planner.execute_mission()
+    planner.return_to_launch()
 
-# From Copter 3.3 you will be able to take off using a mission item. Plane must take off using a mission item (currently).
-arm_and_takeoff(10)
 
-print("Starting mission")
-# Reset mission set to first (0) waypoint
-vehicle.commands.next = 0
-
-# Set mode to AUTO to start mission
-vehicle.mode = VehicleMode("AUTO")
-
-# Monitor mission.
-# Demonstrates getting and setting the command number
-# Uses distance_to_current_waypoint(), a convenience function for finding the
-#   distance to the next waypoint.
-
-while True:
-    nextwaypoint = vehicle.commands.next
-    print('Distance to waypoint (%s): %s' % (nextwaypoint, distance_to_current_waypoint()))
-    print(vehicle.heading)
-    if nextwaypoint == 3:  # Skip to next waypoint
-        print('Skipping to Waypoint 5 when reach waypoint 3')
-        vehicle.commands.next = 5
-    if nextwaypoint == 5:  # Dummy waypoint - as soon as we reach waypoint 4 this is true and we exit.
-        print("Exit 'standard' mission when start heading to final waypoint (5)")
-        break;
-    time.sleep(1)
-
-print('Return to launch')
-vehicle.mode = VehicleMode("RTL")
-
-# Close vehicle object before exiting script
-print("Close vehicle object")
-vehicle.close()
-
+if __name__ == "__main__":
+    main()
