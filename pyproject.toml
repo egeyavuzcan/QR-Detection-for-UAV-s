@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qr-detection-uavs"
+version = "0.1.0"
+description = "QR code detection and mission planning for UAVs."
+authors = [
+    { name = "Your Name", email = "your@email.com" }
+]
+readme = "README.md"
+requires-python = ">=3.6"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "dronekit",
+    "pymavlink"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
