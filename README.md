@@ -11,7 +11,7 @@ cd "QR-Detection-for-UAV-s"
 pip install -e .
 ```
 
-> **Note:** All source code is under the `src/` folder as a Python package.
+
 
 ---
 ## 📦 Dependencies
